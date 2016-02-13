@@ -6,6 +6,7 @@ import "C"
 import (
 	"container/list"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -55,9 +56,7 @@ func newConnection(listenFd int) (connectionInfo, error) {
 	if err != nil {
 		return connectionInfo{}, err
 	}
-	if newFileDescriptor > 1024 {
-		syscall.Close(newFileDescriptor)
-	}
+	syscall.SetNonblock(newFileDescriptor, true)
 	var hostname string
 	switch socketAddr := socketAddr.(type) {
 	default:
@@ -84,41 +83,38 @@ func newConnection(listenFd int) (connectionInfo, error) {
  */
 func serverInstance(srvInfo serverInfo) {
 	client := make(map[int]connectionInfo)
-	epollFd, _ := syscall.EpollCreate(epollQueueLen)
+	epollFd, _ := syscall.EpollCreate1(0)
 	events := make([]syscall.EpollEvent, epollQueueLen)
-	// add listener to epoll queue
-	event := syscall.EpollEvent{Fd: int32(srvInfo.listener)}
-	syscall.EpollCtl(epollFd, syscall.EPOLL_CTL_ADD, srvInfo.listener, &event)
-
+	addConnectionToEPoll(epollFd, srvInfo.listener)
 	for {
-		// goselect library omits nready, select call using syscall
-		n, err := syscall.EpollWait(epollFd, events, -1)
+		_, err := syscall.EpollWait(epollFd, events, -1)
 		if err != nil {
 			log.Println("err", err)
 			return // block shouldn't be hit under normal conditions. If it does something is really wrong.
 		}
 
-		for i := 0; i < n; i++ {
-			if events[i].Fd == int32(srvInfo.listener) {
+		for _, ev := range events {
+			if ev.Fd == int32(srvInfo.listener) { // new connection
 				newClient, err := newConnection(srvInfo.listener)
 				if err == nil {
 					client[newClient.fileDescriptor] = newClient
-					event := syscall.EpollEvent{Fd: int32(newClient.fileDescriptor)}
-					syscall.EpollCtl(epollFd, syscall.EPOLL_CTL_ADD, newClient.fileDescriptor, &event)
+					addConnectionToEPoll(epollFd, newClient.fileDescriptor)
 				}
-			} else {
-				conn := client[int(events[i].Fd)]
-				read, err := handleData(int(events[i].Fd))
+			} else { // data to read from connection
+				conn := client[int(ev.Fd)]
+				_, err := handleData(&conn)
+				client[int(ev.Fd)] = conn
 				if err != nil {
-					endConnection(srvInfo, client[int(events[i].Fd)])
-				} else {
-					conn.ammountOfData += read
-					conn.numberOfRequests++
-					client[int(events[i].Fd)] = conn
+					endConnection(srvInfo, client[int(ev.Fd)])
 				}
 			}
 		}
 	}
+}
+
+func addConnectionToEPoll(epFd int, newFd int) {
+	event := syscall.EpollEvent{Fd: int32(newFd), Events: syscall.EPOLLIN}
+	syscall.EpollCtl(epFd, syscall.EPOLL_CTL_ADD, newFd, &event)
 }
 
 func endConnection(srvInfo serverInfo, conn connectionInfo) {
@@ -127,25 +123,29 @@ func endConnection(srvInfo serverInfo, conn connectionInfo) {
 }
 
 /**/
-func handleData(fd int) (int, error) {
+func handleData(conn *connectionInfo) (int, error) {
 	buf := make([]byte, 1024)
 	var msg string
-	fmt.Println("reading")
 
 	for {
-		n, err := syscall.Read(fd, buf[:])
+		n, err := syscall.Read(conn.fileDescriptor, buf[:])
 		if err != nil {
 			return 0, err
+		}
+		if n == 0 {
+			return len(msg), io.EOF
 		}
 
 		msg += string(buf[:n])
 
 		if strings.ContainsRune(msg, '\n') {
-			fmt.Print(msg)
 			break
 		}
+		conn.ammountOfData += n
+
 	}
-	syscall.Write(fd, []byte(msg))
+	syscall.Write(conn.fileDescriptor, []byte(msg))
+	conn.numberOfRequests++
 
 	return len(msg), nil
 }
@@ -188,10 +188,10 @@ func newServerInfo() serverInfo {
 	if err != nil {
 		log.Println(err)
 	}
-	syscall.SetNonblock(fd, false)
+	syscall.SetNonblock(fd, true)
 	// TODO: make port vairable
-	strconv.Atoi(string(os.Args[1]))
-	addr := syscall.SockaddrInet4{Port: 2000}
+	port, _ := strconv.Atoi(string(os.Args[1]))
+	addr := syscall.SockaddrInet4{Port: port}
 	copy(addr.Addr[:], net.ParseIP("0.0.0.0").To4())
 	syscall.Bind(fd, &addr)
 	syscall.Listen(fd, 1000)
@@ -224,35 +224,4 @@ func main() {
 	signal.Notify(osSignals, os.Interrupt, os.Kill)
 
 	observerLoop(srvInfo, osSignals)
-}
-
-/**FD_SET
- * Emulates system macros for select
- *
- * @author Mindreframer - https://github.com/mindreframer/
- *
- * @desginer unknown
- *
- * @notes:
- * Emulates the system call macros missing from golang
- * Retreived from: https://github.com/mindreframer/golang-stuff/blob/master/github.com/pebbe/zmq2/examples/udpping1.go
- */
-func FD_SET(p *syscall.FdSet, i int) {
-	p.Bits[i/64] |= 1 << uint(i) % 64
-}
-
-func FD_CLR(p *syscall.FdSet, i int) {
-	if FD_ISSET(p, i) {
-		p.Bits[i/64] ^= 1 << uint(i) % 64
-	}
-}
-
-func FD_ISSET(p *syscall.FdSet, i int) bool {
-	return (p.Bits[i/64] & (1 << uint(i) % 64)) != 0
-}
-
-func FD_ZERO(p *syscall.FdSet) {
-	for i := range p.Bits {
-		p.Bits[i] = 0
-	}
 }
