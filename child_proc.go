@@ -27,6 +27,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -68,7 +69,7 @@ func newConnection(listenFd int) (connectionInfo, error) {
 	syscall.SetNonblock(newFileDescriptor, true)
 	hostName := hostString(socketAddr)
 
-	return connectionInfo{fileDescriptor: newFileDescriptor, hostName: hostName}, nil
+	return connectionInfo{FileDescriptor: newFileDescriptor, HostName: hostName}, nil
 }
 
 /*-----------------------------------------------------------------------------
@@ -129,25 +130,28 @@ func listen(srvInfo serverInfo) {
 	epollFd, _ := syscall.EpollCreate1(0)
 	events := make([]syscall.EpollEvent, epollQueueLen)
 	addConnectionToEPoll(epollFd, srvInfo.listener)
+
 	for {
-		_, err := syscall.EpollWait(epollFd, events, -1)
-		if err != nil {
-			continue // need to handle this somehow to prevent a crash. Probably will never be hit
-		}
-		for _, ev := range events {
-			if ev.Fd == int32(srvInfo.listener) { // new connection
+		n, _ := syscall.EpollWait(epollFd, events[:], -1)
+		for i := 0; i < n; i++ {
+			if events[i].Events&(syscall.EPOLLHUP|syscall.EPOLLERR) != 0 {
+				fmt.Println("Error on epoll")
+				endConnection(srvInfo, client[int(events[i].Fd)])
+			}
+			if events[i].Fd == int32(srvInfo.listener) { // new connection
 				newClient, err := newConnection(srvInfo.listener)
 				if err == nil {
-					client[newClient.fileDescriptor] = newClient
-					addConnectionToEPoll(epollFd, newClient.fileDescriptor)
+					srvInfo.serverConnection <- newConnectionConst
+					client[newClient.FileDescriptor] = newClient
+					addConnectionToEPoll(epollFd, newClient.FileDescriptor)
 				}
 			} else { // data to read from connection
 				//  client[int(ev.Fd)] can not be used as an argument in handleData
-				conn := client[int(ev.Fd)]
+				conn := client[int(events[i].Fd)]
 				err := handleData(&conn)
-				client[int(ev.Fd)] = conn
+				client[int(events[i].Fd)] = conn
 				if err != nil {
-					endConnection(srvInfo, client[int(ev.Fd)])
+					endConnection(srvInfo, client[int(events[i].Fd)])
 				}
 			}
 		}
@@ -175,7 +179,7 @@ func listen(srvInfo serverInfo) {
               newFd to epollFd waiting on the event EPOLLIN
 ------------------------------------------------------------------------------*/
 func addConnectionToEPoll(epFd int, newFd int) {
-	event := syscall.EpollEvent{Fd: int32(newFd), Events: syscall.EPOLLIN}
+	event := syscall.EpollEvent{Fd: int32(newFd), Events: (syscall.EPOLLIN | syscall.EPOLLERR | syscall.EPOLLHUP)}
 	syscall.EpollCtl(epFd, syscall.EPOLL_CTL_ADD, newFd, &event)
 }
 
@@ -201,7 +205,7 @@ func addConnectionToEPoll(epFd int, newFd int) {
 ------------------------------------------------------------------------------*/
 func endConnection(srvInfo serverInfo, conn connectionInfo) {
 	srvInfo.connectInfo <- conn
-	syscall.Close(conn.fileDescriptor)
+	syscall.Close(conn.FileDescriptor)
 }
 
 /*-----------------------------------------------------------------------------
@@ -224,13 +228,13 @@ func endConnection(srvInfo serverInfo, conn connectionInfo) {
 -- NOTES:			handles an incoming request from a client.
 ------------------------------------------------------------------------------*/
 func handleData(conn *connectionInfo) error {
-	msg, err := read(conn.fileDescriptor)
+	msg, err := read(conn.FileDescriptor)
 	if err != nil {
 		return err
 	}
-	syscall.Write(conn.fileDescriptor, []byte(msg))
-	conn.numberOfRequests++
-	conn.ammountOfData += len(msg)
+	syscall.Write(conn.FileDescriptor, []byte(msg))
+	conn.NumberOfRequests++
+	conn.AmmountOfData += len(msg)
 
 	return nil
 }
@@ -255,10 +259,12 @@ func handleData(conn *connectionInfo) error {
 --            the connection.
 ------------------------------------------------------------------------------*/
 func read(fd int) (string, error) {
+	fmt.Println(fd)
 	buf := make([]byte, bufferSize)
 	var msg string
 	for {
 		n, err := syscall.Read(fd, buf[:])
+
 		if err != nil {
 			return "", err
 		}
@@ -266,6 +272,10 @@ func read(fd int) (string, error) {
 			return "", io.EOF
 		}
 		msg += string(buf[:n])
+		if err == syscall.EAGAIN {
+			fmt.Println(msg)
+			return msg, nil
+		}
 		if strings.ContainsRune(msg, '\n') {
 			break
 		}
