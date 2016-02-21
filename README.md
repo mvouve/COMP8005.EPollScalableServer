@@ -1,5 +1,5 @@
 # COMP8005.EPollScaleableServer
-This project was written in Go and is intended to aid in comparing the preformance of epoll, select and a traditional multi-threaded network archetecture using go routines. This repository contains the default multithreaded scalable server. The other two repositories in this collection can be found here:
+This project was written in Go and is intended to aid in comparing the preformance of epoll, select and a traditional multi-threaded network archetecture using go routines. This repository contains the default epoll scalable server. The other two repositories in this collection can be found here:
 * [multithreaded](https://github.com/mvouve/COMP8005.ScalableServer)
 * [select](https://github.com/mvouve/COMP8005.SelectScalableServer)
 
